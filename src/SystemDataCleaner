@@ -1,0 +1,750 @@
+#!/bin/bash
+#
+# System Data Cleaner
+# A simple, safe macOS app that finds what is filling up "System Data"
+# and removes each category ONLY after you explicitly confirm it.
+#
+# Nothing is deleted without a per-category "Delete" click.
+# Protected/system locations are never touched.
+#
+set -u
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+
+APP_TITLE="System Data Cleaner"
+HOME_DIR="$HOME"
+WORK="$(mktemp -d)"
+RESULTS="$WORK/results.tsv"   # SIZEKB \t NAME \t DESC \t TYPE \t PAYLOAD
+: > "$RESULTS"
+# Payloads may list several paths. We join them with this sentinel (ASCII Unit
+# Separator) so every category stays on ONE line in the TSV — storing real
+# newlines there previously split one category into many bogus 0 KB records.
+SEP=$'\037'
+
+# ----------------------------------------------------------------------------
+# Dialog helpers (all UI is native, via AppleScript)
+# ----------------------------------------------------------------------------
+
+# confirm <message> <leftBtn> <rightBtn> <defaultBtn>  -> echoes the button text
+confirm() {
+  osascript - "$1" "$2" "$3" "$4" "$APP_TITLE" <<'OSA'
+on run argv
+  set msg to item 1 of argv
+  set b1 to item 2 of argv
+  set b2 to item 3 of argv
+  set db to item 4 of argv
+  set ttl to item 5 of argv
+  try
+    display dialog msg with title ttl buttons {b1, b2} default button db with icon note
+    return button returned of result
+  on error number -128
+    return b1
+  end try
+end run
+OSA
+}
+
+# confirm3 <message> <b1> <b2> <b3> <defaultBtn>  -> echoes the button text
+confirm3() {
+  osascript - "$1" "$2" "$3" "$4" "$5" "$APP_TITLE" <<'OSA'
+on run argv
+  set msg to item 1 of argv
+  set b1 to item 2 of argv
+  set b2 to item 3 of argv
+  set b3 to item 4 of argv
+  set db to item 5 of argv
+  set ttl to item 6 of argv
+  try
+    display dialog msg with title ttl buttons {b1, b2, b3} default button db with icon note
+    return button returned of result
+  on error number -128
+    return b1
+  end try
+end run
+OSA
+}
+
+# menu -> echoes the chosen option's leading keyword (Map / Scan / Clean / Quit)
+menu() {
+  osascript - "$APP_TITLE" <<'OSA'
+on run argv
+  set ttl to item 1 of argv
+  set o1 to "Sim Runtimes  —  review & remove Xcode simulator runtimes (you pick each)"
+  set o2 to "Disk Map  —  fast: find hidden space (snapshots / extra volumes)"
+  set o3 to "Deep Scan  —  list the biggest folders on disk"
+  set o4 to "Quick Clean  —  review & remove caches/junk (you confirm each)"
+  set choice to choose from list {o1, o2, o3, o4} with title ttl with prompt "What would you like to do?" default items {o1} OK button name "Continue" cancel button name "Quit"
+  if choice is false then
+    return "Quit"
+  else
+    return item 1 of choice
+  end if
+end run
+OSA
+}
+
+# info <message> [buttonLabel]
+info() {
+  local btn="${2:-OK}"
+  osascript - "$1" "$btn" "$APP_TITLE" <<'OSA'
+on run argv
+  set msg to item 1 of argv
+  set btn to item 2 of argv
+  set ttl to item 3 of argv
+  display dialog msg with title ttl buttons {btn} default button btn with icon note
+end run
+OSA
+}
+
+# run a shell command as administrator (GUI password prompt). Arg: the command string.
+admin_run() {
+  osascript - "$1" "$APP_TITLE" <<'OSA'
+on run argv
+  set cmd to item 1 of argv
+  do shell script cmd with administrator privileges
+end run
+OSA
+}
+
+# human-readable size from KB
+human() {
+  local kb="$1"
+  awk -v k="$kb" 'BEGIN{
+    if (k < 1024) { printf "%d KB", k }
+    else if (k < 1048576) { printf "%.1f MB", k/1024 }
+    else if (k < 1073741824) { printf "%.2f GB", k/1048576 }
+    else { printf "%.2f TB", k/1073741824 }
+  }'
+}
+
+# size in KB of a path (0 if missing)
+size_kb() {
+  [ -e "$1" ] || { echo 0; return; }
+  du -sk "$1" 2>/dev/null | awk '{print $1}'
+}
+
+# free space on the boot volume, human readable
+free_space() {
+  df -k / 2>/dev/null | awk 'NR==2{printf "%.2f GB", $4/1048576}'
+}
+
+# add a category: <name> <desc> <type> <payload> <one-or-more-paths-to-size...>
+# size is the sum of the listed paths.
+add_cat() {
+  local name="$1" desc="$2" type="$3" payload="$4"; shift 4
+  local total=0 p s
+  for p in "$@"; do
+    s="$(size_kb "$p")"
+    total=$((total + s))
+  done
+  # only record if there is something meaningful (> ~5 MB) or it's a special scanner
+  if [ "$total" -gt 5120 ] || [ "$type" = "snapshots" ] || [ "$type" = "simctl" ]; then
+    printf '%s\t%s\t%s\t%s\t%s\n' "$total" "$name" "$desc" "$type" "${payload//$'\n'/$SEP}" >> "$RESULTS"
+  fi
+}
+
+# add a cache category by finding standard cache subfolders under one or more
+# app roots. Only well-known cache dir names are matched, so profile data,
+# passwords, history, bookmarks, etc. are never touched. These dirs are removed
+# entirely (type rmtree) because apps recreate them automatically.
+add_cache_cat() {
+  local name="$1" desc="$2"; shift 2
+  local root paths="" found
+  for root in "$@"; do
+    [ -d "$root" ] || continue
+    found="$(find "$root" -maxdepth 4 -type d \( \
+        -name 'Cache' -o -name 'Caches' -o -name 'Code Cache' -o \
+        -name 'GPUCache' -o -name 'GrShaderCache' -o -name 'ShaderCache' -o \
+        -name 'DawnCache' -o -name 'DawnGraphiteCache' -o -name 'DawnWebGPUCache' -o \
+        -name 'CacheStorage' -o -name 'CachedData' -o -name 'component_crx_cache' -o \
+        -name 'GPUCache' \) 2>/dev/null)"
+    if [ -n "$found" ]; then
+      if [ -z "$paths" ]; then paths="$found"; else paths="$paths
+$found"; fi
+    fi
+  done
+  [ -z "$paths" ] && return
+  # size = sum of all found cache dirs
+  local total=0 s
+  while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    s="$(size_kb "$p")"; total=$((total + s))
+  done <<< "$paths"
+  if [ "$total" -gt 5120 ]; then
+    printf '%s\t%s\t%s\t%s\t%s\n' "$total" "$name" "$desc" "rmtree" "${paths//$'\n'/$SEP}" >> "$RESULTS"
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Simulator Runtimes: Xcode stores each iOS/watchOS/tvOS simulator runtime as
+# its own mounted APFS volume, so folder scans can't see them — often the
+# biggest hidden user of disk space. This lists EVERY installed runtime with
+# its size and lets you Skip or Delete each one (default is Skip, so nothing is
+# removed unless you choose it). Removal uses Apple's own `simctl` (no password)
+# and Xcode re-downloads any runtime you need again later. No assumptions are
+# made about which platforms you use.
+# ----------------------------------------------------------------------------
+runtimes_clean() {
+  if ! command -v xcrun >/dev/null 2>&1; then
+    info "Xcode command-line tools weren't found, so simulator runtimes can't be managed here.
+
+You can remove them in Xcode: Settings ▸ Components (or Platforms), then delete the old simulator versions."
+    return
+  fi
+
+  # Build a size map from JSON: KEY (uuid or build) -> sizeKB (real on-disk size).
+  local json sizemap="$WORK/simsize.txt"; : > "$sizemap"
+  json="$(xcrun simctl runtime list -j 2>/dev/null)"
+  [ -z "$json" ] && json="$(xcrun simctl runtime list --json 2>/dev/null)"
+  if [ -n "$json" ] && command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$json" | python3 -c '
+import json,sys
+try: data=json.load(sys.stdin)
+except Exception: sys.exit(0)
+items=[]
+if isinstance(data,dict) and isinstance(data.get("runtimes"),list): items=data["runtimes"]
+elif isinstance(data,list): items=data
+elif isinstance(data,dict): items=list(data.values())
+for r in items:
+    if not isinstance(r,dict): continue
+    ident=r.get("identifier") or ""
+    build=r.get("buildversion") or r.get("build") or ""
+    size=r.get("sizeBytes") or 0
+    try: sk=int(size)//1024
+    except Exception: sk=0
+    if sk<=0: continue
+    if ident: print(str(ident)+"\t"+str(sk))
+    if build: print(str(build)+"\t"+str(sk))
+' >> "$sizemap" 2>/dev/null
+  fi
+
+  # Parse the human-readable list. Real (Xcode 16+) format is:
+  #   == Disk Images ==
+  #   -- iOS --
+  #   iOS 18.4 (22E238) - <UUID> (Ready)
+  # We also handle the legacy "== Runtimes ==" lines that end in a
+  # com.apple...SimRuntime identifier. PLATFORM \t VERSION \t BUILD \t ID
+  local parsed="$WORK/simparsed.txt"; : > "$parsed"
+  local raw section=""
+  raw="$(xcrun simctl runtime list 2>/dev/null)"
+  while IFS= read -r line; do
+    case "$line" in
+      "-- "*" --") section="$(printf '%s' "$line" | sed -E 's/^-- *//; s/ *--$//')"; continue ;;
+    esac
+    case "$line" in
+      "iOS "*|"watchOS "*|"tvOS "*) ;;
+      *) continue ;;
+    esac
+    # platform/version from the first two tokens
+    local p v b id
+    p="$(printf '%s' "$line" | awk '{print $1}')"
+    v="$(printf '%s' "$line" | awk '{print $2}')"
+    # build = first parenthesised token, e.g. (22E238)
+    b="$(printf '%s' "$line" | sed -E 's/^[^(]*\(([^)]*)\).*/\1/')"
+    # id = token right after " - " (a UUID or a com.apple identifier)
+    id="$(printf '%s' "$line" | sed -E 's/^.* - ([^ ]+).*/\1/')"
+    [ -n "$id" ] && printf '%s\t%s\t%s\t%s\n' "$p" "$v" "$b" "$id" >> "$parsed"
+  done <<< "$raw"
+
+  # Save raw + parsed output to the Desktop for troubleshooting.
+  { echo "=== simctl runtime list ==="; printf '%s\n' "$raw"
+    echo; echo "=== parsed (platform / ver / build / id) ==="; cat "$parsed" 2>/dev/null
+  } > "$HOME_DIR/Desktop/SimRuntimes_raw.txt" 2>/dev/null
+
+  # List EVERY installed runtime (no assumptions). You decide each one.
+  local targets_unsorted="$WORK/simtargets_u.txt"; : > "$targets_unsorted"
+  local targets="$WORK/simtargets.txt"; : > "$targets"
+  local total_kb=0
+  while IFS=$'\t' read -r platform ver bd id; do
+    [ -z "$id" ] && continue
+    case "$platform" in iOS|watchOS|tvOS) : ;; *) continue ;; esac
+    local sk
+    sk="$(awk -F'\t' -v k="$id" '$1==k{print $2; exit}' "$sizemap")"
+    [ -z "$sk" ] && [ -n "$bd" ] && sk="$(awk -F'\t' -v k="$bd" '$1==k{print $2; exit}' "$sizemap")"
+    [ -z "$sk" ] && sk=0
+    total_kb=$((total_kb + sk))
+    printf '%s\t%s\t%s\t%s\n' "$platform $ver" "$id" "$bd" "$sk" >> "$targets_unsorted"
+  done < "$parsed"
+
+  if [ ! -s "$targets_unsorted" ]; then
+    info "No simulator runtimes were detected.
+
+I saved the raw runtime list to your Desktop as SimRuntimes_raw.txt — if you expected runtimes here, send that file to Claude."
+    return
+  fi
+
+  # Sort by platform then version (newest first) for a readable list.
+  sort -t$'\t' -k1,1 -V -r "$targets_unsorted" > "$targets"
+
+  # Summary
+  local list=""
+  while IFS=$'\t' read -r nm id bd sk; do
+    if [ "${sk:-0}" -gt 0 ]; then list="$list
+• $nm  —  ≈$(human "$sk")"; else list="$list
+• $nm"; fi
+  done < "$targets"
+
+  local ans
+  ans="$(confirm "Installed simulator runtimes ($(human "$total_kb") total):
+$list
+
+You'll be asked about each one next. The default is Skip, so nothing is removed unless you click Delete. Tip: keep the newest version of each platform you actually build for; older ones are usually safe to remove. Xcode re-downloads any runtime you need again." "Cancel" "Continue" "Continue")"
+  [ "$ans" != "Continue" ] && return
+
+  local freed_kb=0 removed=0
+  while IFS=$'\t' read -r nm id bd sk; do
+    local label="$nm"
+    [ "${sk:-0}" -gt 0 ] && label="$nm (≈$(human "$sk"))"
+    ans="$(confirm "Remove simulator runtime:
+$label
+
+Delete it now?" "Skip" "Delete" "Skip")"
+    [ "$ans" != "Delete" ] && continue
+    if xcrun simctl runtime delete "$id" >/dev/null 2>&1 || { [ -n "$bd" ] && xcrun simctl runtime delete "$bd" >/dev/null 2>&1; }; then
+      freed_kb=$((freed_kb + ${sk:-0}))
+      removed=$((removed + 1))
+    else
+      info "Could not remove \"$nm\". It may be in use by a running simulator. Quit the Simulator app and try again. Nothing else was changed."
+    fi
+  done < "$targets"
+
+  info "Simulator cleanup done.
+
+Runtimes removed: $removed
+Space reclaimed: ≈$(human "$freed_kb")
+Free space before: $FREE_BEFORE
+Free space now:    $(free_space)
+
+The Storage screen can take a few minutes to refresh." "Finish"
+}
+
+# ----------------------------------------------------------------------------
+# Disk Map: read-only, fast. Reveals APFS volumes and snapshots — i.e. space
+# that a folder scan can't see. This is what finds a huge "System Data" that
+# isn't in any visible folder. Deletes nothing.
+# ----------------------------------------------------------------------------
+disk_map() {
+  local report="$HOME_DIR/Desktop/DiskMap.txt"
+
+  # Snapshots on both the System and Data volumes
+  local snaps_root snaps_data sc_root sc_data
+  snaps_root="$(tmutil listlocalsnapshots / 2>/dev/null | grep 'com.apple.TimeMachine')"
+  snaps_data="$(tmutil listlocalsnapshots /System/Volumes/Data 2>/dev/null | grep 'com.apple.TimeMachine')"
+  sc_root="$(printf '%s\n' "$snaps_root" | grep -c .)"
+  sc_data="$(printf '%s\n' "$snaps_data" | grep -c .)"
+
+  {
+    echo "Disk Map — APFS container, volumes & snapshots"
+    echo "Generated: $(date)"
+    echo
+    echo "=== Mounted volumes (df -h) ==="
+    df -h
+    echo
+    echo "=== Local Time Machine snapshots on / ($sc_root) ==="
+    printf '%s\n' "$snaps_root"
+    echo
+    echo "=== Local Time Machine snapshots on /System/Volumes/Data ($sc_data) ==="
+    printf '%s\n' "$snaps_data"
+    echo
+    echo "=== diskutil list ==="
+    diskutil list
+    echo
+    echo "=== diskutil apfs list (per-volume Capacity Consumed + snapshots) ==="
+    diskutil apfs list
+  } > "$report" 2>&1
+
+  # Pull a concise container summary from diskutil apfs list
+  local summary
+  summary="$(diskutil apfs list 2>/dev/null | grep -E 'APFS Container Reference|Size \(Capacity Ceiling\)|Capacity In Use By Volumes|Capacity Not Allocated|Volume .* \(|Capacity Consumed|Snapshot' | sed 's/^[[:space:]]*//')"
+
+  info "Disk Map complete.
+
+Local Time Machine snapshots — on / : $sc_root, on Data : $sc_data
+
+A full report was saved to your Desktop as:
+DiskMap.txt
+
+This shows every APFS volume and how much each one is really consuming, which reveals space a folder scan can't see. Open it (or send it to Claude) to pinpoint the hidden space. Nothing was deleted." "Done"
+}
+
+# ----------------------------------------------------------------------------
+# Deep Scan: read-only. Finds the biggest folders anywhere on the disk so you
+# can see exactly where "System Data" space is going. Deletes nothing.
+# ----------------------------------------------------------------------------
+deep_scan() {
+  local report="$HOME_DIR/Desktop/SystemData_BigFolders.txt"
+  local du_all="$WORK/du_all.txt"
+  : > "$du_all"
+
+  info "Deep Scan will measure every large folder on your disk and list the biggest ones. This is READ-ONLY — it deletes nothing.
+
+It can take 2–10 minutes. You may be asked for your admin password so it can see system folders too.
+
+Click OK to start, then please wait — another window will appear when it finishes." "Start Deep Scan"
+
+  # User-space roots (no password needed)
+  du -x -d 5 -k "$HOME_DIR" 2>/dev/null >> "$du_all"
+
+  # System-space roots (need admin). The privileged process writes results to a
+  # file (far more reliable than returning huge output through AppleScript),
+  # then we read that file back.
+  local sysdu="$WORK/sysdu.txt"
+  : > "$sysdu"
+  admin_run "nice -n 5 du -x -d 3 -k /Library /private /usr/local /opt /Applications /cores /var 2>/dev/null > '$sysdu'; chmod 644 '$sysdu' 2>/dev/null" >/dev/null 2>&1
+  local SYS_OK="no"
+  if [ -s "$sysdu" ]; then SYS_OK="yes"; cat "$sysdu" >> "$du_all"; fi
+
+  # Time Machine local snapshots (invisible to du; a top hidden-space cause)
+  local SNAP_COUNT
+  SNAP_COUNT="$(tmutil listlocalsnapshots / 2>/dev/null | grep -c 'com.apple.TimeMachine')"
+  [ -z "$SNAP_COUNT" ] && SNAP_COUNT=0
+
+  # Purgeable space (snapshots + reclaimable caches that df counts as used)
+  local PURGE
+  PURGE="$(diskutil info /System/Volumes/Data 2>/dev/null | sed -n 's/.*Purgeable Space:[[:space:]]*\([0-9.]* [KMGT]B\).*/\1/p' | head -1)"
+  [ -z "$PURGE" ] && PURGE="$(diskutil info / 2>/dev/null | sed -n 's/.*Purgeable Space:[[:space:]]*\([0-9.]* [KMGT]B\).*/\1/p' | head -1)"
+
+  if [ ! -s "$du_all" ]; then
+    info "Deep Scan could not read any folders (the password prompt may have been cancelled). Nothing was changed."
+    return
+  fi
+
+  # Sort biggest first; keep only folders >= 1 GB for the full report.
+  local sorted="$WORK/du_sorted.txt"
+  sort -nr "$du_all" > "$sorted"
+
+  # Write a readable report to the Desktop.
+  {
+    echo "System Data Cleaner — biggest folders on this Mac"
+    echo "Generated: $(date)"
+    echo "Free space now: $(free_space)"
+    echo "System folders scanned (needs password): $SYS_OK"
+    echo "Time Machine local snapshots: $SNAP_COUNT"
+    [ -n "$PURGE" ] && echo "Purgeable space (snapshots/caches macOS can reclaim): $PURGE"
+    echo
+    echo "Folders 1 GB and larger (largest first):"
+    echo "----------------------------------------"
+    awk -F'\t' '$1>=1048576' "$sorted" | while IFS=$'\t' read -r kb path; do
+      printf '%10s  %s\n' "$(human "$kb")" "$path"
+    done
+  } > "$report" 2>/dev/null
+
+  # Build a top-25 summary, skipping nested duplicates of a parent already shown
+  # (simple approach: just show the top 25 lines overall).
+  local summary="" n=0 TILDE='~'
+  while IFS=$'\t' read -r kb path; do
+    [ "$n" -ge 25 ] && break
+    short="${path/#$HOME_DIR/$TILDE}"
+    summary="$summary
+$(human "$kb")  —  $short"
+    n=$((n+1))
+  done < "$sorted"
+
+  local sysnote=""
+  if [ "$SYS_OK" = "no" ]; then
+    sysnote="
+⚠️ System folders were NOT scanned (no password entered), so big system-level space is missing from this list. Re-run and enter your password for the full picture."
+  fi
+  local snapnote=""
+  if [ "${SNAP_COUNT:-0}" -gt 0 ]; then
+    snapnote="
+🕖 $SNAP_COUNT Time Machine local snapshot(s) found."
+  fi
+  [ -n "$PURGE" ] && snapnote="$snapnote
+♻️ Purgeable space macOS can reclaim: $PURGE (mostly snapshots/caches). Use Quick Clean → Time Machine snapshots to free it."
+
+  info "Deep Scan complete. The 25 biggest folders:
+$summary
+$sysnote$snapnote
+
+Full report saved to your Desktop: SystemData_BigFolders.txt
+
+Open it (or send the top lines to Claude) to decide what to clean. This scan deleted nothing." "Done"
+}
+
+# ----------------------------------------------------------------------------
+# Welcome
+# ----------------------------------------------------------------------------
+FREE_BEFORE="$(free_space)"
+choice="$(menu)"
+
+case "$choice" in
+  Quit|"") rm -rf "$WORK"; exit 0 ;;
+  "Sim Runtimes"*) runtimes_clean; rm -rf "$WORK"; exit 0 ;;
+  "Disk Map"*) disk_map; rm -rf "$WORK"; exit 0 ;;
+  "Deep Scan"*) deep_scan; rm -rf "$WORK"; exit 0 ;;
+  "Quick Clean"*) : ;;  # continue below
+  *) rm -rf "$WORK"; exit 0 ;;
+esac
+
+# ----------------------------------------------------------------------------
+# Scan categories
+# ----------------------------------------------------------------------------
+DEV="$HOME_DIR/Library/Developer"
+
+add_cat "User caches" \
+  "App caches in your Library/Caches. Safe to remove; apps rebuild them as needed." \
+  "rmcontents" "$HOME_DIR/Library/Caches" \
+  "$HOME_DIR/Library/Caches"
+
+add_cat "User logs" \
+  "Application and diagnostic logs in your Library/Logs. Safe to remove." \
+  "rmcontents" "$HOME_DIR/Library/Logs" \
+  "$HOME_DIR/Library/Logs"
+
+add_cat "Trash" \
+  "Items already in your Trash. Removing them frees the space for good." \
+  "rmcontents" "$HOME_DIR/.Trash" \
+  "$HOME_DIR/.Trash"
+
+add_cat "Xcode DerivedData" \
+  "Build intermediates for Xcode projects. Rebuilt automatically on next build." \
+  "rmcontents" "$DEV/Xcode/DerivedData" \
+  "$DEV/Xcode/DerivedData"
+
+add_cat "Xcode device support" \
+  "Debug symbols for iOS/watchOS/tvOS versions, including ones you no longer use. Re-downloaded if needed." \
+  "rmcontents" "$DEV/Xcode/iOS DeviceSupport
+$DEV/Xcode/watchOS DeviceSupport
+$DEV/Xcode/tvOS DeviceSupport" \
+  "$DEV/Xcode/iOS DeviceSupport" "$DEV/Xcode/watchOS DeviceSupport" "$DEV/Xcode/tvOS DeviceSupport"
+
+add_cat "Xcode archives & logs" \
+  "Old app archives and build logs from Xcode." \
+  "rmcontents" "$DEV/Xcode/Archives
+$DEV/Xcode/Products
+$DEV/Xcode/iOS Device Logs" \
+  "$DEV/Xcode/Archives" "$DEV/Xcode/Products" "$DEV/Xcode/iOS Device Logs"
+
+add_cat "iOS Simulator caches" \
+  "Caches and unavailable/obsolete simulators from Xcode. Recreated on demand." \
+  "simctl" "$DEV/CoreSimulator/Caches" \
+  "$DEV/CoreSimulator/Caches"
+
+add_cat "iPhone/iPad backups" \
+  "Local device backups in MobileSync. These can be very large. Remove ONLY if you back up to iCloud or no longer need them." \
+  "rmcontents" "$HOME_DIR/Library/Application Support/MobileSync/Backup" \
+  "$HOME_DIR/Library/Application Support/MobileSync/Backup"
+
+add_cat "Homebrew cache" \
+  "Downloaded Homebrew package files. Safe to clear." \
+  "rmcontents" "$HOME_DIR/Library/Caches/Homebrew" \
+  "$HOME_DIR/Library/Caches/Homebrew"
+
+add_cat "npm / Yarn caches" \
+  "Cached JavaScript packages. Safe to clear; re-downloaded when needed." \
+  "rmcontents" "$HOME_DIR/.npm/_cacache
+$HOME_DIR/Library/Caches/Yarn" \
+  "$HOME_DIR/.npm/_cacache" "$HOME_DIR/Library/Caches/Yarn"
+
+add_cat "pip cache" \
+  "Cached Python packages. Safe to clear." \
+  "rmcontents" "$HOME_DIR/Library/Caches/pip" \
+  "$HOME_DIR/Library/Caches/pip"
+
+add_cat "System caches (needs password)" \
+  "Shared caches in /Library/Caches. Requires your admin password to remove." \
+  "admin_rmcontents" "/Library/Caches" \
+  "/Library/Caches"
+
+# Time Machine local snapshots - special scanner (counts snapshots)
+SNAP_COUNT="$(tmutil listlocalsnapshots / 2>/dev/null | grep -c 'com.apple.TimeMachine')"
+if [ "${SNAP_COUNT:-0}" -gt 0 ]; then
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "999999999" \
+    "Time Machine local snapshots ($SNAP_COUNT)" \
+    "Hidden Time Machine snapshots stored on this disk. These are the #1 hidden cause of a huge \"System Data\" figure and are usually the biggest single win. Your real Time Machine backups on external/network drives are NOT affected." \
+    "snapshots" "/" >> "$RESULTS"
+fi
+
+# --- Thunderbird cached IMAP mail (re-downloads from your mail server) -------
+TB_PROFILES="$HOME_DIR/Library/Thunderbird/Profiles"
+if [ -d "$TB_PROFILES" ]; then
+  tb_paths="$(find "$TB_PROFILES" -maxdepth 2 -type d -name 'ImapMail' 2>/dev/null)"
+  if [ -n "$tb_paths" ]; then
+    tb_total=0
+    while IFS= read -r p; do [ -n "$p" ] && tb_total=$((tb_total + $(size_kb "$p"))); done <<< "$tb_paths"
+    if [ "$tb_total" -gt 5120 ]; then
+      printf '%s\t%s\t%s\t%s\t%s\n' "$tb_total" \
+        "Thunderbird cached IMAP mail" \
+        "Local copies of your IMAP email. Removing them frees space; Thunderbird re-downloads messages from your mail server next time it syncs. QUIT THUNDERBIRD before deleting. Your Local Folders and account settings are NOT affected." \
+        "rmcontents" "${tb_paths//$'\n'/$SEP}" >> "$RESULTS"
+    fi
+  fi
+fi
+
+# --- Browser / app caches (safe; rebuilt automatically) ---------------------
+add_cache_cat "Google Chrome cache" \
+  "Chrome's web/code/GPU caches. Safe to clear; your bookmarks, history, passwords and the on-device AI model are NOT touched." \
+  "$HOME_DIR/Library/Application Support/Google/Chrome" \
+  "$HOME_DIR/Library/Caches/Google"
+
+add_cache_cat "Cursor cache" \
+  "Editor caches for Cursor. Safe; rebuilt on next launch. Your settings and projects are not affected." \
+  "$HOME_DIR/Library/Application Support/Cursor" \
+  "$HOME_DIR/Library/Caches/com.todesktop"
+
+add_cache_cat "Microsoft Teams cache" \
+  "Teams web/GPU caches. Safe; rebuilt automatically." \
+  "$HOME_DIR/Library/Application Support/Microsoft/Teams" \
+  "$HOME_DIR/Library/Containers/com.microsoft.teams2"
+
+add_cat "Steam download/app cache" \
+  "Steam's appcache and shader/download caches. Safe; Steam rebuilds them. Your installed games are NOT affected." \
+  "rmcontents" "$HOME_DIR/Library/Application Support/Steam/appcache" \
+  "$HOME_DIR/Library/Application Support/Steam/appcache"
+
+# ----------------------------------------------------------------------------
+# Nothing found?
+# ----------------------------------------------------------------------------
+if [ ! -s "$RESULTS" ]; then
+  info "Scan complete. No large, safely-removable items were found in the usual System Data locations.
+
+If System Data is still large, the space is likely in active app data, virtual machines, or container/Docker disk images, which this tool intentionally does not auto-delete."
+  rm -rf "$WORK"
+  exit 0
+fi
+
+# Sort by size descending
+SORTED="$WORK/sorted.tsv"
+sort -t$'\t' -k1,1 -nr "$RESULTS" > "$SORTED"
+
+# Build a summary string
+SUMMARY=""
+TOTAL_KB=0
+while IFS=$'\t' read -r sz name desc type payload; do
+  if [ "$type" = "snapshots" ]; then
+    SUMMARY="$SUMMARY
+• $name — local snapshots present"
+  else
+    SUMMARY="$SUMMARY
+• $name — $(human "$sz")"
+    TOTAL_KB=$((TOTAL_KB + sz))
+  fi
+done < "$SORTED"
+
+menu_choice="$(confirm3 "Scan complete.
+
+Reclaimable from listed categories: about $(human "$TOTAL_KB")
+(plus Time Machine local snapshots, if shown)
+$SUMMARY
+
+• DELETE ALL — remove every item above in one go.
+• CHOOSE EACH — decide item by item.
+(Admin-password and Time Machine items still prompt as needed.)" "Cancel" "Choose each" "Delete all" "Choose each")"
+
+case "$menu_choice" in
+  "Cancel"|"") rm -rf "$WORK"; exit 0 ;;
+  "Delete all") DELETE_ALL="yes" ;;
+  *) DELETE_ALL="no" ;;
+esac
+
+# ----------------------------------------------------------------------------
+# Confirm + act on each category
+# ----------------------------------------------------------------------------
+FREED_KB=0
+while IFS=$'\t' read -r sz name desc type payload; do
+  # Decode the payload back into newline-separated paths.
+  payload="${payload//$SEP/$'\n'}"
+  # Skip empty / zero-size non-special items (defensive).
+  [ "$type" != "snapshots" ] && [ "${sz:-0}" -le 0 ] && continue
+
+  if [ "$type" = "snapshots" ]; then
+    if [ "$DELETE_ALL" = "yes" ]; then
+      ans="Delete"
+    else
+      ans="$(confirm "$name
+
+$desc
+
+Delete all local Time Machine snapshots now? (Requires your admin password.)" "Skip" "Delete" "Skip")"
+    fi
+    if [ "$ans" = "Delete" ]; then
+      # Build a script that deletes every local snapshot, then thins aggressively.
+      cmd='for s in $(tmutil listlocalsnapshots / | sed "s/com.apple.TimeMachine.//"); do tmutil deletelocalsnapshots "$s"; done; tmutil thinlocalsnapshots / 9999999999999 4'
+      if admin_run "$cmd" >/dev/null 2>&1; then
+        info "Local Time Machine snapshots deleted. Free space may take a moment to update.
+
+Free space now: $(free_space)"
+      else
+        info "Could not remove snapshots (cancelled or failed). Nothing was changed for this item."
+      fi
+    fi
+    continue
+  fi
+
+  prompt="$name — $(human "$sz")
+
+$desc
+
+Delete this now?"
+  if [ "$type" = "admin_rmcontents" ]; then
+    prompt="$prompt
+(Requires your admin password.)"
+  fi
+  if [ "$DELETE_ALL" = "yes" ]; then
+    ans="Delete"
+  else
+    ans="$(confirm "$prompt" "Skip" "Delete" "Skip")"
+  fi
+  [ "$ans" != "Delete" ] && continue
+
+  case "$type" in
+    rmcontents)
+      while IFS= read -r dir; do
+        [ -z "$dir" ] && continue
+        [ -d "$dir" ] || continue
+        find "$dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
+      done <<< "$payload"
+      FREED_KB=$((FREED_KB + sz))
+      ;;
+    rmtree)
+      # Remove the listed cache directories entirely (they regenerate). Only
+      # paths whose final component is a known cache name are deleted, as a
+      # safety guard against an unexpected payload.
+      while IFS= read -r dir; do
+        [ -z "$dir" ] && continue
+        [ -d "$dir" ] || continue
+        case "$(basename "$dir")" in
+          Cache|Caches|"Code Cache"|GPUCache|GrShaderCache|ShaderCache|DawnCache|DawnGraphiteCache|DawnWebGPUCache|CacheStorage|CachedData|component_crx_cache)
+            rm -rf "$dir" 2>/dev/null ;;
+          *) : ;;  # refuse anything that isn't a recognized cache dir
+        esac
+      done <<< "$payload"
+      FREED_KB=$((FREED_KB + sz))
+      ;;
+    admin_rmcontents)
+      acmd=""
+      while IFS= read -r dir; do
+        [ -z "$dir" ] && continue
+        acmd="$acmd find '$dir' -mindepth 1 -maxdepth 1 -exec rm -rf {} + ;"
+      done <<< "$payload"
+      if admin_run "$acmd" >/dev/null 2>&1; then
+        FREED_KB=$((FREED_KB + sz))
+      else
+        info "Skipped (cancelled or failed). Nothing was changed for this item."
+      fi
+      ;;
+    simctl)
+      xcrun simctl delete unavailable >/dev/null 2>&1
+      while IFS= read -r dir; do
+        [ -z "$dir" ] && continue
+        [ -d "$dir" ] && find "$dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
+      done <<< "$payload"
+      FREED_KB=$((FREED_KB + sz))
+      ;;
+  esac
+done < "$SORTED"
+
+# ----------------------------------------------------------------------------
+# Done
+# ----------------------------------------------------------------------------
+info "All done.
+
+Removed from listed categories: about $(human "$FREED_KB")
+Free space before: $FREE_BEFORE
+Free space now:    $(free_space)
+
+Tip: the Storage screen in System Settings can take a few minutes to refresh its \"System Data\" figure." "Finish"
+
+rm -rf "$WORK"
+exit 0
