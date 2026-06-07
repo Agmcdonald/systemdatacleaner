@@ -17,6 +17,11 @@ chmod +x "$APP/Contents/MacOS/SystemDataCleaner"
 cp Info.plist "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
+if [ -f assets/AppIcon.icns ]; then
+  echo "Adding app icon..."
+  cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+fi
+
 echo "Zipping..."
 ( cd build && zip -r -y -X SystemDataCleaner.zip SystemDataCleaner.app >/dev/null )
 

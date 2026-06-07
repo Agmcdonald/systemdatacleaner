@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/logo.png" alt="System Data Cleaner logo" width="380">
+</p>
+
 # System Data Cleaner
 
 A tiny, dependency-free macOS app that finds what's actually filling up your
